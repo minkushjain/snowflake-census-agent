@@ -1,0 +1,13 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.claude/

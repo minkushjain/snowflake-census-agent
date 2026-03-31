@@ -1,13 +1,27 @@
 """
 All Claude prompt templates as module-level string constants.
-Never inline prompts in business logic — always reference from here.
+
+Keeping prompts here (not inline in business logic) makes them:
+  - Easy to version, diff, and iterate on without touching orchestration code
+  - Testable in isolation by importing and inspecting them
+  - Clearly separated from control flow so reviewers can audit them independently
+
+Template strings use {placeholder} format — filled by agent.py via .format().
 """
 
+# Centralized DB name so prompts stay consistent everywhere.
 DB = "US_OPEN_CENSUS_DATA__NEIGHBORHOOD_INSIGHTS__FREE_DATASET"
 
 # ---------------------------------------------------------------------------
 # SQL Generation System Prompt
 # ---------------------------------------------------------------------------
+# This is the most critical prompt — it defines Claude's "SQL expert" persona
+# and encodes all the hard-won rules from debugging real Snowflake errors:
+#   - Table names starting with digits must be double-quoted
+#   - ACS column names are case-sensitive and must match the schema exactly
+#   - census_block_group must NOT be double-quoted (stored uppercase in Snowflake)
+#   - Use NULLIF(denominator, 0) for all percentage calculations
+# The REFUSAL: contract at the bottom enables guardrails.is_refusal() detection.
 SYSTEM_PROMPT_SQL = f"""\
 You are an expert US Census data analyst with deep knowledge of the American Community Survey (ACS) \
 5-year estimates (2019 vintage). You write precise Snowflake SQL queries against the SafeGraph \
@@ -82,6 +96,12 @@ OUTPUT FORMAT:
 # ---------------------------------------------------------------------------
 # Answer Synthesis System Prompt
 # ---------------------------------------------------------------------------
+# Deliberately shorter than the SQL prompt — at this stage Claude has the data
+# and just needs formatting guidance. Key rules:
+#   - Cite specific numbers (not "many" or "significant")
+#   - Mention 2019 ACS vintage so users know the data age
+#   - Flag county-as-city approximations so users aren't misled
+#   - Never reproduce the full raw table (Claude already saw it; the UI shows it)
 SYSTEM_PROMPT_ANSWER = """\
 You are a helpful and knowledgeable US Census data analyst. You have just executed a SQL query \
 against the 2019 American Community Survey (ACS) 5-year estimates data and received the results.
@@ -109,6 +129,13 @@ SAFETY:
 # ---------------------------------------------------------------------------
 # User Prompt Templates
 # ---------------------------------------------------------------------------
+# USER_PROMPT_SQL_TEMPLATE — assembled in agent.run_query_phase() and sent as the
+# "user" turn alongside SYSTEM_PROMPT_SQL. Sections in order:
+#   1. schema_context: the 1-2 most relevant ACS tables + their key columns
+#   2. geographic_notes: FIPS structure, quoting rules, aggregation patterns
+#   3. city_note: county FIPS hint if a known city was detected (may be empty)
+#   4. history: last N conversation turns for follow-up context
+#   5. question: the user's current question
 USER_PROMPT_SQL_TEMPLATE = """\
 {schema_context}
 
@@ -150,6 +177,9 @@ Please explain to the user why there might be no results and suggest how they co
 or narrow their question to get useful data.
 """
 
+# Retry template — used when Snowflake returns a ProgrammingError on the first attempt.
+# Includes the failed SQL and Snowflake's error message so Claude can diagnose and fix
+# the exact problem (usually a wrong column name or missing double-quotes).
 USER_PROMPT_SQL_RETRY_TEMPLATE = """\
 {schema_context}
 
@@ -177,6 +207,9 @@ Pay close attention to column names — only use columns listed in the schema ab
 # ---------------------------------------------------------------------------
 # Follow-up Question Suggestions
 # ---------------------------------------------------------------------------
+# Uses a smaller/cheaper model (Haiku) — suggestions are low-stakes and don't
+# need Sonnet's accuracy. Returns a JSON array so get_followup_suggestions()
+# can parse without regex fragility. max_tokens=200 is enough for 3 short strings.
 SYSTEM_PROMPT_FOLLOWUP = """\
 You are a US Census data assistant. Based on the question just answered, suggest exactly 3 short, \
 specific follow-up questions the user might want to ask next.

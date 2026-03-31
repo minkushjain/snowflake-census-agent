@@ -8,6 +8,12 @@ automatically by clearing the cache and reconnecting.
 Query results are cached in-process for CACHE_TTL_SECONDS (1 hour) to avoid
 redundant Snowflake calls for repeated identical questions. Cache is keyed on
 the exact SQL string (SHA-256). Only successful results are cached.
+
+Two-level caching strategy:
+  - st.cache_resource: connection object, shared across all users on this worker
+  - _QUERY_CACHE (in-process dict): result rows, keyed by SHA-256 of SQL string
+    Benefits: repeated questions return instantly, consume zero Snowflake credits.
+    Limitation: lost on worker restart. Redis/Postgres would be needed for persistence.
 """
 
 import hashlib
@@ -19,21 +25,31 @@ from typing import Any
 
 DB = "US_OPEN_CENSUS_DATA__NEIGHBORHOOD_INSIGHTS__FREE_DATASET"
 SCHEMA = "PUBLIC"
-QUERY_TIMEOUT_SECONDS = 50  # leaves buffer for Claude API latency
+# 50s leaves ~10s buffer before the assignment's 60s hard deadline.
+# Snowflake's STATEMENT_TIMEOUT_IN_SECONDS is set to this value in the session params.
+QUERY_TIMEOUT_SECONDS = 50
 
 # ---------------------------------------------------------------------------
 # Query result cache (in-process, shared across Streamlit sessions)
 # ---------------------------------------------------------------------------
+# Format: { sha256_of_sql: (rows, columns, cached_at_timestamp) }
+# Only successful results are cached — errors always execute fresh so transient
+# Snowflake issues don't get stuck in cache.
 _QUERY_CACHE: dict[str, tuple[list, list, float]] = {}
-_CACHE_TTL_SECONDS = 3600  # 1 hour
+_CACHE_TTL_SECONDS = 3600  # 1 hour — long enough for a session, short enough to stay fresh
 
 
 @st.cache_resource(show_spinner=False)
 def _get_connection() -> snowflake.connector.SnowflakeConnection:
     """Create and cache a Snowflake connection using Streamlit secrets.
 
-    Supports both externalbrowser (SSO) and password authentication,
-    controlled by the 'authenticator' key in secrets.toml.
+    @st.cache_resource means this function runs once per Streamlit worker process
+    and the connection object is reused for all sessions. show_spinner=False prevents
+    an ugly "Running..." banner appearing every time the connection is checked.
+
+    Supports both externalbrowser (SSO) and password auth, controlled by the
+    'authenticator' key in secrets.toml. externalbrowser requires a browser popup
+    and cannot be used on Streamlit Cloud — use password auth for deployment.
     """
     sf = st.secrets["connections"]["snowflake"]
 
@@ -43,9 +59,12 @@ def _get_connection() -> snowflake.connector.SnowflakeConnection:
         "database": DB,
         "schema": SCHEMA,
         "login_timeout": 60,
-        "network_timeout": QUERY_TIMEOUT_SECONDS + 5,
+        "network_timeout": QUERY_TIMEOUT_SECONDS + 5,  # slightly above query timeout
         "session_parameters": {
+            # QUERY_TAG makes these queries identifiable in Snowflake's query history/audit logs.
             "QUERY_TAG": "census_chat_agent",
+            # Server-side timeout is the true enforcement mechanism — the Python timeout
+            # is a best-effort client-side guard that may fire slightly later.
             "STATEMENT_TIMEOUT_IN_SECONDS": str(QUERY_TIMEOUT_SECONDS),
         },
     }
@@ -85,15 +104,15 @@ def execute_query(sql: str) -> tuple[list[dict[str, Any]], list[str]]:
         TimeoutError: Query exceeded QUERY_TIMEOUT_SECONDS.
         RuntimeError: Any other database/connection error.
     """
-    # Check cache
+    # SHA-256 of the exact SQL string is the cache key. temperature=0 in SQL generation
+    # makes identical questions produce identical SQL, so this cache is highly effective.
     cache_key = hashlib.sha256(sql.strip().encode()).hexdigest()
     now = time.time()
     if cache_key in _QUERY_CACHE:
         rows, columns, cached_at = _QUERY_CACHE[cache_key]
         if now - cached_at < _CACHE_TTL_SECONDS:
             return rows, columns
-        # Expired — remove stale entry
-        del _QUERY_CACHE[cache_key]
+        del _QUERY_CACHE[cache_key]  # expired — remove so stale data isn't served
 
     conn = _try_get_connection()
 
@@ -108,16 +127,21 @@ def execute_query(sql: str) -> tuple[list[dict[str, Any]], list[str]]:
         return rows, columns
 
     except ProgrammingError as e:
-        # SQL syntax / logic error — propagate so the caller can retry with error info
+        # ProgrammingError = bad SQL (wrong column name, syntax error, etc.).
+        # Re-raise without caching so agent.py can send the error to Claude for retry.
         raise ProgrammingError(str(e)) from e
 
     except OperationalError as e:
         msg = str(e).lower()
         if "timeout" in msg or "statement timeout" in msg:
+            # Convert to TimeoutError so agent.py can show a friendlier message
+            # and avoid retrying (a retry would just time out again).
             raise TimeoutError(
                 "Query exceeded the 50-second time limit. Try a more specific geographic area or simpler query."
             ) from e
-        # Connection likely went stale — clear cache and re-raise
+        # Non-timeout OperationalError typically means the connection went stale
+        # (idle too long, Streamlit worker recycled, network blip). Reset so the
+        # next call gets a fresh connection automatically.
         _reset_connection()
         raise RuntimeError(f"Database connection error: {e}") from e
 
@@ -133,19 +157,25 @@ def clear_query_cache() -> int:
 
 
 def _try_get_connection() -> snowflake.connector.SnowflakeConnection:
-    """Get connection; if stale/closed, reset cache and reconnect."""
+    """Get connection; if stale/closed, reset cache and reconnect.
+
+    The SELECT 1 liveness ping adds ~1ms but prevents cryptic errors when the
+    connection has gone idle (common after Streamlit Cloud scales down an inactive
+    worker). Cheaper than reconnecting on every query error.
+    """
     try:
         conn = _get_connection()
-        # Quick liveness check
         conn.cursor().execute("SELECT 1")
         return conn
     except Exception:
+        # Most common cause: stale cached connector after worker idle time.
         _reset_connection()
         return _get_connection()
 
 
 def _reset_connection() -> None:
-    """Clear the cached connection so the next call creates a fresh one."""
+    """Clear the st.cache_resource entry so the next _get_connection() call
+    creates a fresh Snowflake connection instead of returning the stale cached one."""
     _get_connection.clear()
 
 

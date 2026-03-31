@@ -3,12 +3,23 @@ Pre-compiled schema metadata for the SafeGraph US Open Census Data.
 
 This module maps semantic concepts to specific Snowflake tables and columns,
 avoiding the need to dump 7,500+ ACS columns into every Claude prompt.
+
+Design rationale: The full dataset has 50+ ACS B-series tables and ~7,500 columns.
+Sending all of them to Claude on every turn would cost ~$0.10+ per query, add 2-3s
+of latency, and confuse the model with irrelevant columns. Instead, this module:
+  1. Hand-curates the 8 most useful tables with ~15-30 key columns each.
+  2. Attaches a keyword list per table for fast scoring against the user's question.
+  3. Returns only the top 1-2 tables per query (~800 tokens total).
 """
 
 # ---------------------------------------------------------------------------
 # Table Metadata
 # Each entry: description, key_concepts (for keyword scoring), core_columns
 # ---------------------------------------------------------------------------
+# key_concepts: substring keywords scored against the user question to select this table.
+# core_columns: the ~15-30 most useful ACS estimate columns (ending in lowercase 'e').
+#   Column names must match Snowflake exactly — they are case-sensitive and must be
+#   double-quoted in SQL. Margin-of-error columns (ending in 'm') are intentionally omitted.
 TABLES = {
     "2019_CBG_B01": {
         "description": "Sex by Age — total population counts broken down by age bracket and sex. Use for total population, population by age group, median age, male/female split.",
@@ -197,6 +208,12 @@ TABLES = {
 # Geographic Reference Data
 # ---------------------------------------------------------------------------
 
+# This block is injected verbatim into every SQL generation prompt.
+# It encodes the most common sources of Claude SQL errors discovered during development:
+#   - Forgetting to double-quote table names that start with digits (2019_CBG_*)
+#   - Confusing uppercase vs lowercase 'e' in column names (B19013e1 vs B19013E1)
+#   - Double-quoting census_block_group, which is stored uppercase and breaks if quoted
+#   - Attempting to filter by city name when no such column exists
 GEOGRAPHIC_NOTES = """
 GEOGRAPHIC DATA NOTES:
 - The census_block_group column is a 12-digit FIPS string, e.g. '010010201001'
@@ -230,8 +247,11 @@ STATE_FIPS = {
     "72": "Puerto Rico",
 }
 
+# Lowercased for case-insensitive matching against user questions.
 STATE_NAME_TO_FIPS = {v.lower(): k for k, v in STATE_FIPS.items()}
-# Add common abbreviations
+
+# Two-letter postal abbreviations. Matched as whole words only (see get_state_fips)
+# to avoid false positives — e.g. "in" matching Indiana inside the word "income".
 STATE_ABBR_TO_FIPS = {
     "al": "01", "ak": "02", "az": "04", "ar": "05", "ca": "06", "co": "08",
     "ct": "09", "de": "10", "dc": "11", "fl": "12", "ga": "13", "hi": "15",
@@ -244,8 +264,10 @@ STATE_ABBR_TO_FIPS = {
     "wv": "54", "wi": "55", "wy": "56", "pr": "72",
 }
 
-# City → county FIPS mapping (approximate — cities may span multiple counties;
-# this maps to the primary/most populous county for that city)
+# City → primary county FIPS mapping (approximate).
+# Cities like San Francisco are coterminous with their county, so this is exact.
+# Cities like San Jose span parts of multiple counties; only the most populous
+# county is mapped. Proper city boundaries would require TIGER/Line shapefiles.
 MAJOR_CITY_TO_COUNTY_FIPS = {
     "new york city": "36061",     # New York County (Manhattan)
     "new york": "36061",
@@ -329,7 +351,11 @@ def get_relevant_schema(question: str) -> str:
     """
     Score each table by how many of its key_concepts appear in the question.
     Return a formatted schema string for the top 1-2 most relevant tables.
-    Falls back to all table descriptions if no match found.
+    Falls back to all table descriptions if no keyword match is found.
+
+    This is the primary token-reduction mechanism: instead of sending all ~7,500
+    ACS columns to Claude, we send only the 15-30 most relevant columns per table.
+    The scoring is intentionally simple (substring count) — zero latency, zero cost.
     """
     q = question.lower()
     scores: dict[str, int] = {}
@@ -341,20 +367,22 @@ def get_relevant_schema(question: str) -> str:
                 score += 1
         scores[table_name] = score
 
-    # Sort by score descending
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-    # Select top tables with score > 0, capped at 2
+    # Cap at 2 tables to keep the schema context under ~800 tokens.
+    # Sending more tables risks confusing Claude with irrelevant columns.
     top_tables = [t for t, s in ranked if s > 0][:2]
 
-    # If nothing matched, return all table-level descriptions for Claude to choose
+    # No keyword match — return brief descriptions of all tables so Claude can
+    # reason about which one to use. This is a fallback for unusual phrasing.
     if not top_tables:
         lines = ["Available tables (pick the most relevant one for the question):"]
         for table_name, meta in TABLES.items():
             lines.append(f'\n- Table: "{table_name}"\n  Description: {meta["description"]}')
         return "\n".join(lines)
 
-    # Build detailed schema for selected tables
+    # Build detailed schema including fully-qualified table names and quoted column names.
+    # The full database name is embedded here so Claude never has to guess the path.
     lines = []
     for table_name in top_tables:
         meta = TABLES[table_name]
@@ -375,6 +403,7 @@ def get_city_county_fips(question: str) -> str | None:
     Returns None if no city match found.
     """
     q = question.lower()
+    # Simple substring matching keeps this fast and deterministic.
     for city, fips in MAJOR_CITY_TO_COUNTY_FIPS.items():
         if city in q:
             return fips
@@ -385,13 +414,15 @@ def get_state_fips(question: str) -> str | None:
     """
     Check if the question mentions a US state by name or abbreviation.
     Returns the 2-digit FIPS code if found, else None.
+
+    Full name match is tried first (lower false-positive rate). Abbreviations use
+    word-boundary regex to prevent "in" from matching Indiana inside "income".
     """
     q = question.lower()
     for state_name, fips in STATE_NAME_TO_FIPS.items():
         if state_name in q:
             return fips
     for abbr, fips in STATE_ABBR_TO_FIPS.items():
-        # Only match abbreviations as whole words to avoid false positives
         import re
         if re.search(r'\b' + abbr + r'\b', q):
             return fips

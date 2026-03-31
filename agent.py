@@ -49,8 +49,13 @@ from utils import (
     format_conversation_for_prompt,
 )
 
+# Sonnet 4.6 chosen for its strong instruction-following and SQL accuracy.
+# Swapping to a different model only requires changing this constant.
 MODEL = "claude-sonnet-4-6"
+
+# 1024 tokens is enough for even complex multi-table SQL; overshooting wastes latency.
 MAX_TOKENS_SQL = 1024
+# 1536 gives Claude room for a thorough 3-4 paragraph answer without padding.
 MAX_TOKENS_ANSWER = 1536
 
 
@@ -60,6 +65,7 @@ MAX_TOKENS_ANSWER = 1536
 
 @dataclass
 class AgentResponse:
+    """Final response payload returned to the Streamlit UI layer."""
     answer: str
     sql: str | None = None
     row_count: int = 0
@@ -93,7 +99,12 @@ def _log(msg: str) -> None:
 
 
 def _get_anthropic_client() -> anthropic.Anthropic:
-    """Initialize Anthropic client from Streamlit secrets (never at module import)."""
+    """Initialize Anthropic client from Streamlit secrets (never at module import).
+
+    Intentionally not cached — each call creates a fresh client, which is cheap
+    (no network call). Avoiding module-level init ensures secrets are available
+    when the function is first called, not when the module is imported.
+    """
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 
@@ -104,7 +115,12 @@ def _call_claude(
     max_tokens: int,
     temperature: float,
 ) -> str:
-    """Call Claude synchronously and return the response text."""
+    """Call Claude synchronously and return the response text.
+
+    Used for SQL generation (temperature=0, deterministic) and the retry path.
+    Answer synthesis uses the streaming variant instead — see stream_answer().
+    History is intentionally not passed here; the caller embeds it in user_message.
+    """
     response = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -116,7 +132,13 @@ def _call_claude(
 
 
 def _build_city_note(question: str) -> str:
-    """If question mentions a known city, return a FIPS hint for SQL generation."""
+    """If question mentions a known city, return a FIPS hint for SQL generation.
+
+    The ACS dataset has no city column — only 12-digit Census Block Group FIPS codes.
+    Cities are approximated by filtering to their primary county's 5-digit FIPS prefix.
+    This note is injected into the SQL prompt so Claude generates the correct WHERE clause
+    instead of hallucinating a non-existent city filter.
+    """
     fips = get_city_county_fips(question)
     if fips:
         q_lower = question.lower()
@@ -151,6 +173,9 @@ def _execute_with_retry(
         return rows, columns, sql
 
     except ProgrammingError as e:
+        # ProgrammingError means the SQL is syntactically/semantically wrong
+        # (e.g., wrong column name, bad quoting). Send it back to Claude with the
+        # error message so it can self-correct. Only retry once to bound latency.
         error_msg = str(e)
         _log(f"  ✗ SQL error (will retry): {error_msg[:120]}")
 
@@ -229,9 +254,12 @@ def run_query_phase(
         )
     _log("  ✓ Guardrail passed")
 
-    # Step 2: Schema selection
+    # Step 2: Schema selection — keyword scoring picks the 1-2 most relevant ACS
+    # tables out of 8 and returns only their columns (~800 tokens vs 7,500+ for the
+    # full schema). This is the primary cost and latency optimization in the pipeline.
     schema_context = get_relevant_schema(question)
     city_note = _build_city_note(question)
+    # Keep last 8 turns to give Claude follow-up context without blowing up the prompt.
     trimmed_history = trim_conversation_history(conversation_history, max_turns=8)
     history_text = format_conversation_for_prompt(trimmed_history)
 
@@ -243,7 +271,8 @@ def run_query_phase(
         question=question,
     )
 
-    # Step 3: SQL generation
+    # Step 3: SQL generation — temperature=0 makes output deterministic so the same
+    # question always produces the same SQL. This also improves caching hit rates.
     _log("  → Claude #1: generating SQL...")
     client = _get_anthropic_client()
     try:
@@ -300,7 +329,10 @@ def run_query_phase(
     rows: list[dict] = rows_or_err
     _log(f"  ✓ Snowflake returned {len(rows)} row(s), columns: {columns}")
 
-    # Pre-build the answer synthesis prompt
+    # Pre-build the answer prompt here (Phase 1) so stream_answer() (Phase 2) needs
+    # no extra arguments — the _QueryPhase object carries everything it needs.
+    # max_rows=50 caps the markdown table size sent to Claude; beyond that we show
+    # a truncation note. Full results are still stored in phase.rows for the UI.
     if not rows:
         answer_prompt = USER_PROMPT_ANSWER_EMPTY_TEMPLATE.format(
             question=question, sql=final_sql
@@ -331,6 +363,10 @@ def stream_answer(phase: _QueryPhase) -> Generator[str, None, None]:
     """
     Phase 2: stream the natural language answer from Claude.
     Yields text chunks suitable for st.write_stream().
+
+    Split from Phase 1 so the UI can show a progress indicator during SQL execution,
+    then immediately begin streaming the answer token-by-token once data arrives.
+    temperature=0.3 allows natural-sounding prose while staying factually grounded.
     """
     try:
         with phase.client.messages.stream(
@@ -342,6 +378,8 @@ def stream_answer(phase: _QueryPhase) -> Generator[str, None, None]:
         ) as stream:
             yield from stream.text_stream
     except anthropic.APIError:
+        # Data was fetched successfully — only the summary generation failed.
+        # Yield a recoverable message so the user knows what happened.
         yield "I retrieved the data but encountered an error generating the summary. Please try again."
 
 
@@ -352,28 +390,74 @@ def stream_answer(phase: _QueryPhase) -> Generator[str, None, None]:
 def get_followup_suggestions(question: str) -> list[str]:
     """
     Return 3 short follow-up question suggestions related to the answered question.
-    Uses claude-haiku for speed/cost. Returns [] on any error.
+    Uses a lightweight Claude model when available and falls back gracefully.
     """
     import json
-    try:
-        client = _get_anthropic_client()
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
-            temperature=0.7,
-            system=SYSTEM_PROMPT_FOLLOWUP,
-            messages=[{
-                "role": "user",
-                "content": USER_PROMPT_FOLLOWUP_TEMPLATE.format(question=question),
-            }],
-        )
-        text = response.content[0].text.strip()
-        suggestions = json.loads(text)
-        if isinstance(suggestions, list):
-            return [s for s in suggestions if isinstance(s, str)][:3]
-    except Exception:
-        pass
-    return []
+    import re
+
+    def _default_suggestions() -> list[str]:
+        """Safe fallback shown when model output is unavailable/unparseable."""
+        return [
+            "How does this compare to the national average?",
+            "Can you break this down by state or county?",
+            "How has this changed over time?",
+        ]
+
+    def _normalize_suggestions(items: object) -> list[str]:
+        """Clean model output into short, unique strings for UI buttons."""
+        if not isinstance(items, list):
+            return []
+        cleaned: list[str] = []
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            suggestion = " ".join(item.split()).strip()
+            if suggestion:
+                cleaned.append(suggestion[:140])
+        # De-dupe while preserving order
+        return list(dict.fromkeys(cleaned))[:3]
+
+    def _parse_suggestions(raw_text: str) -> list[str]:
+        """Parse strict JSON first, then recover JSON arrays from wrapped text."""
+        text = raw_text.strip()
+        try:
+            return _normalize_suggestions(json.loads(text))
+        except Exception:
+            # Handle fenced markdown / extra explanatory text around the array.
+            if text.startswith("```"):
+                text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            match = re.search(r"\[[\s\S]*\]", text)
+            if not match:
+                return []
+            try:
+                return _normalize_suggestions(json.loads(match.group(0)))
+            except Exception:
+                return []
+
+    client = _get_anthropic_client()
+    user_prompt = USER_PROMPT_FOLLOWUP_TEMPLATE.format(question=question)
+    # Haiku is significantly cheaper and faster than Sonnet for this low-stakes task.
+    # Falling back to MODEL ensures suggestions still appear even if Haiku is unavailable.
+    model_candidates = ("claude-haiku-4-5-20251001", MODEL)
+
+    for model_name in model_candidates:
+        try:
+            response = client.messages.create(
+                model=model_name,
+                max_tokens=200,
+                temperature=0.7,
+                system=SYSTEM_PROMPT_FOLLOWUP,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            text = response.content[0].text
+            suggestions = _parse_suggestions(text)
+            if suggestions:
+                return suggestions
+        except Exception as e:
+            _log(f"  ⚠ Follow-up suggestion generation failed with {model_name}: {str(e)[:120]}")
+
+    return _default_suggestions()
 
 
 # ---------------------------------------------------------------------------

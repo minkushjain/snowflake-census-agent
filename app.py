@@ -1,7 +1,14 @@
 """
 US Census Data Chat Agent — Streamlit web application.
-Beautiful, interactive chat interface with streaming answers, auto-charts, and CSV export.
-Features: dark mode, multi-session conversation history, follow-up suggestions.
+
+This file is purely the presentation layer. It owns:
+  - Session state management (multi-session conversations in st.session_state)
+  - Light/dark theme injection via raw CSS (Streamlit's theme API is too limited)
+  - The sidebar (navigation, settings, example questions, export)
+  - Auto-visualization pipeline (metrics → choropleth map → bar chart → key insights)
+  - The main chat loop (user input → agent calls → streaming render → chart render)
+
+Business logic lives in agent.py. All AI and database calls go through that module.
 """
 
 import time
@@ -12,7 +19,8 @@ import streamlit as st
 from agent import run_query_phase, stream_answer, get_followup_suggestions
 from utils import fips_to_state_name
 
-# State FIPS → 2-letter abbreviation (for choropleth)
+# Plotly's choropleth locationmode="USA-states" requires 2-letter postal abbreviations,
+# but Snowflake query results return 2-digit numeric FIPS codes. This dict bridges them.
 STATE_FIPS_TO_ABBR = {
     "01":"AL","02":"AK","04":"AZ","05":"AR","06":"CA","08":"CO","09":"CT",
     "10":"DE","11":"DC","12":"FL","13":"GA","15":"HI","16":"ID","17":"IL",
@@ -38,6 +46,7 @@ st.set_page_config(
 # Session state initialisation
 # ---------------------------------------------------------------------------
 def _new_session() -> dict:
+    """Create a fresh chat session container with default metadata."""
     n = len(st.session_state.get("sessions", [])) + 1
     return {
         "id": str(uuid.uuid4())[:8],
@@ -48,6 +57,8 @@ def _new_session() -> dict:
         "generating": False,
     }
 
+# st.session_state persists across reruns but is scoped to a single browser tab.
+# It's reset when the Streamlit worker restarts (e.g., after idle on Community Cloud).
 if "sessions" not in st.session_state:
     first = _new_session()
     st.session_state.sessions = [first]
@@ -55,10 +66,13 @@ if "sessions" not in st.session_state:
 
 st.session_state.setdefault("show_sql", True)
 st.session_state.setdefault("dark_mode", False)
+# prefilled_question is set by example/suggestion buttons, then consumed on the next
+# rerun to pre-populate the chat input. Cleared immediately after use.
 st.session_state.setdefault("prefilled_question", None)
 
 
 def _get_session(sid: str) -> dict:
+    """Fetch session by id; fall back to first session if missing."""
     for s in st.session_state.sessions:
         if s["id"] == sid:
             return s
@@ -66,6 +80,7 @@ def _get_session(sid: str) -> dict:
 
 
 def _current() -> dict:
+    """Convenience accessor for the currently active session."""
     return _get_session(st.session_state.current_session_id)
 
 
@@ -341,6 +356,9 @@ p, span, label, h1, h2, h3 { color: #e2e8f0 !important; }
 </style>
 """
 
+# CSS is injected as raw HTML because Streamlit's config.toml theme only controls
+# a narrow set of color variables — it cannot style individual components, the sidebar
+# background, chat bubbles, or the metric cards we need.
 st.markdown(DARK_CSS if st.session_state.dark_mode else LIGHT_CSS, unsafe_allow_html=True)
 
 # Hide the sidebar collapse button so users can't accidentally close it
@@ -571,10 +589,16 @@ if not messages:
 # Chart helpers
 # ---------------------------------------------------------------------------
 def _enrich_with_state_names(rows: list[dict], columns: list[str]) -> tuple[list[dict], list[str]]:
-    """Replace 2-digit FIPS codes with readable state names for chart labels."""
+    """Replace 2-digit FIPS codes with readable state names for chart labels.
+
+    State-level SQL aggregations return LEFT(census_block_group, 2) = "06", "48" etc.
+    Without this enrichment, bar chart labels would show cryptic numeric FIPS codes.
+    Only the first column that passes the 2-digit numeric heuristic is converted.
+    """
     if not rows:
         return rows, columns
 
+    # Sample the first 5 values of each column to detect FIPS without scanning all rows.
     fips_col = None
     for col in columns:
         vals = [str(r.get(col, "")) for r in rows if r.get(col) is not None]
@@ -614,7 +638,12 @@ def _detect_label_value(df: pd.DataFrame, columns: list[str]) -> tuple[str | Non
 
 
 def _try_render_map(rows: list[dict], columns: list[str]) -> bool:
-    """Render a US choropleth map when data covers 10+ states. Returns True if rendered."""
+    """Render a US choropleth map when data covers 10+ states. Returns True if rendered.
+
+    The 10-row threshold prevents rendering a near-empty map for queries that return
+    only 1-3 states — a bar chart is more useful in that case.
+    Returns True so the caller knows to skip the bar chart (map already rendered).
+    """
     if not rows or len(rows) < 10 or len(columns) < 2:
         return False
 
@@ -628,6 +657,7 @@ def _try_render_map(rows: list[dict], columns: list[str]) -> bool:
     if not all(s in STATE_FIPS_TO_ABBR for s in sample):
         return False
 
+    # Plotly US choropleth expects 2-letter state abbreviations.
     df["state_abbr"] = df[label_col].apply(lambda v: STATE_FIPS_TO_ABBR.get(str(v).strip().zfill(2), ""))
     df = df[df["state_abbr"] != ""]
     if len(df) < 10:
@@ -658,7 +688,12 @@ def _try_render_map(rows: list[dict], columns: list[str]) -> bool:
 
 
 def _try_render_chart(rows: list[dict], columns: list[str]) -> bool:
-    """Render interactive Plotly horizontal bar chart for ranked results. Returns True if rendered."""
+    """Render interactive Plotly horizontal bar chart for ranked results. Returns True if rendered.
+
+    Upper bound of 50 rows keeps the chart readable — beyond that a table is more useful.
+    Horizontal orientation is chosen because state/county names are long and would overlap
+    on a vertical bar chart's x-axis.
+    """
     if not rows or len(rows) < 2 or len(rows) > 50 or len(columns) < 2:
         return False
 
@@ -668,6 +703,7 @@ def _try_render_chart(rows: list[dict], columns: list[str]) -> bool:
     if not label_col or not value_col:
         return False
 
+    # Keep top 20 rows so charts remain readable.
     chart_df = (
         df[[label_col, value_col]]
         .dropna()
@@ -679,6 +715,7 @@ def _try_render_chart(rows: list[dict], columns: list[str]) -> bool:
 
     col_label = value_col.replace("_", " ").title()
     n = len(chart_df)
+    # Soft blue gradient for a consistent visual style.
     colors = [f"rgba(0, {int(68 + i * (180 / max(n - 1, 1)))}, {int(150 + i * (80 / max(n - 1, 1)))}, 0.85)" for i in range(n)]
 
     fig = px.bar(
@@ -730,6 +767,7 @@ def _render_key_insights(rows: list[dict], columns: list[str]) -> None:
     avg_val = df[value_col].mean()
 
     def _fmt(v):
+        """Format large values for compact display in insight cards."""
         if v >= 1_000_000:
             return f"{v / 1_000_000:.1f}M"
         if v >= 1_000:
@@ -768,11 +806,17 @@ def _render_key_insights(rows: list[dict], columns: list[str]) -> None:
 
 
 def _try_render_metrics(rows: list[dict], columns: list[str]) -> bool:
-    """If result is a single row with numeric columns, render as metric cards. Returns True if rendered."""
+    """If result is a single row with numeric columns, render as metric cards. Returns True if rendered.
+
+    Single-row results (e.g. "What is the total US population?") look much better as
+    large metric cards than as a 1-row table or 1-bar chart. Cap at 6 columns to avoid
+    an overcrowded row of tiny cards.
+    """
     if len(rows) != 1 or not columns:
         return False
 
     row = rows[0]
+    # Extract numeric fields only; skip text-like columns.
     numeric_pairs = []
     for col in columns:
         val = row.get(col)
@@ -806,8 +850,10 @@ def _try_render_metrics(rows: list[dict], columns: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Orphan cleanup — if a rerun interrupted generation mid-stream, the user
-# message was appended but the assistant message was never saved. Remove it.
+# Orphan cleanup — handles the edge case where a browser refresh or st.rerun()
+# interrupted generation after the user message was appended but before the
+# assistant message was saved. Without this, the UI would re-render an unanswered
+# user bubble and confuse the conversation history.
 # ---------------------------------------------------------------------------
 _sess = _current()
 if _sess.get("generating") and _sess["messages"] and _sess["messages"][-1]["role"] == "user":
@@ -818,7 +864,7 @@ if _sess.get("generating") and _sess["messages"] and _sess["messages"][-1]["role
 # ---------------------------------------------------------------------------
 # Render existing conversation
 # ---------------------------------------------------------------------------
-for msg in messages:
+for msg_idx, msg in enumerate(messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
@@ -863,12 +909,31 @@ for msg in messages:
                     unsafe_allow_html=True,
                 )
 
+            followups = msg.get("followups", [])
+            if followups:
+                st.markdown(
+                    "<div style='font-size:0.8rem; color:#718096; margin-top:12px; margin-bottom:6px;'>"
+                    "💡 <b>You might also ask:</b></div>",
+                    unsafe_allow_html=True,
+                )
+                sug_cols = st.columns(len(followups))
+                for i, suggestion in enumerate(followups):
+                    with sug_cols[i]:
+                        if st.button(
+                            suggestion,
+                            key=f"sug_hist_{msg.get('timestamp', msg_idx)}_{i}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.prefilled_question = suggestion
+                            st.rerun()
+
 # ---------------------------------------------------------------------------
 # Handle input
 # ---------------------------------------------------------------------------
 user_input: str | None = st.chat_input("Ask anything about US Census data…")
 
 if st.session_state.prefilled_question and not user_input:
+    # Programmatic question sources (example buttons, follow-ups) flow through here.
     user_input = st.session_state.prefilled_question
     st.session_state.prefilled_question = None
 
@@ -887,10 +952,15 @@ if user_input:
         {"role": "user", "content": user_input, "timestamp": time.time()}
     )
 
-    # Auto-name the session from first question
+    # Auto-name the session from the first question so the sidebar shows a meaningful
+    # label like "Which states have the highest…" instead of "Chat 1".
     if session["query_count"] == 0:
         session["name"] = user_input[:30] + ("…" if len(user_input) > 30 else "")
 
+    # Keep just role/content so prompts stay compact and model-relevant.
+    # Build history from all messages except the current one (the last element,
+    # just appended above). Only pass role+content — SQL/rows/timestamps are stripped
+    # by format_conversation_for_prompt() in utils.py.
     agent_history = [
         {"role": m["role"], "content": m["content"]}
         for m in session["messages"][:-1]
@@ -898,10 +968,14 @@ if user_input:
     ]
 
     generation_complete = False
+    followup_suggestions: list[str] = []
     try:
         with st.chat_message("assistant"):
             start_ts = time.time()
 
+            # st.status shows a live progress indicator during the synchronous Phase 1
+            # (guardrails + SQL generation + Snowflake execution). Once Phase 1 is done
+            # the status collapses and streaming text begins appearing immediately.
             with st.status("Analyzing question…", expanded=True) as status:
                 st.write("🔍 Understanding your question…")
                 phase, err_response = run_query_phase(user_input, agent_history)
@@ -926,6 +1000,9 @@ if user_input:
                 row_count = 0
 
             else:
+                # st.write_stream consumes the generator from stream_answer() and
+                # renders each text chunk as it arrives — the user sees text appear
+                # token-by-token rather than waiting for the full response.
                 answer = st.write_stream(stream_answer(phase))
                 final_sql = phase.sql
                 final_rows = phase.rows
@@ -965,6 +1042,7 @@ if user_input:
 
                 # Follow-up suggestions
                 suggestions = get_followup_suggestions(user_input)
+                followup_suggestions = suggestions
                 if suggestions:
                     st.markdown(
                         "<div style='font-size:0.8rem; color:#718096; margin-top:12px; margin-bottom:6px;'>"
@@ -993,6 +1071,7 @@ if user_input:
                 "rows": final_rows,
                 "columns": final_columns,
                 "row_count": row_count,
+                "followups": followup_suggestions,
                 "elapsed_ms": elapsed_ms,
                 "timestamp": time.time(),
             }
@@ -1000,8 +1079,8 @@ if user_input:
         generation_complete = True
 
     finally:
+        # Always reset the generating flag so the orphan cleanup at the top of the
+        # next rerun can detect the incomplete state and remove the dangling user message.
         session["generating"] = False
-        # If generation was interrupted before the assistant message was saved,
-        # remove the orphaned user message so the user can retry cleanly.
         if not generation_complete and session["messages"] and session["messages"][-1]["role"] == "user":
             session["messages"].pop()

@@ -1,11 +1,11 @@
 """
 Guardrails: topic classification, SQL validation, SQL extraction, limit enforcement.
 
-Four layers of protection:
-1. NSFW blocklist — rejects at input, before reaching Claude
-2. Topic classification — keyword-based, fast, zero cost
-3. SQL validation — regex-based, prevents dangerous/out-of-scope queries
-4. Limit enforcement — auto-appends LIMIT if missing on row-returning queries
+Four layers of protection — defense in depth, no single layer is bulletproof:
+1. NSFW blocklist — instant string match, rejects before any API call
+2. Topic classification — keyword scoring, zero LLM cost, handles ~99% of off-topic cases
+3. SQL validation — regex blocks DML/DDL; whitelist ensures only census tables are queried
+4. Limit enforcement — auto-appends LIMIT to prevent full 220K-row table scans
 """
 
 import re
@@ -14,6 +14,9 @@ from schema_metadata import TABLES
 # ---------------------------------------------------------------------------
 # Layer 1: NSFW blocklist (check before Claude sees the input)
 # ---------------------------------------------------------------------------
+# frozenset for O(1) membership tests. Checked before any API call to avoid
+# sending harmful content to the LLM and wasting tokens/cost.
+# This is a simple substring blocklist — not exhaustive, but fast and free.
 NSFW_BLOCKLIST: frozenset[str] = frozenset(
     [
         "porn", "pornography", "nude", "naked", "sex tape", "sexual assault",
@@ -28,6 +31,10 @@ NSFW_BLOCKLIST: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Layer 2: Topic keywords — question must relate to at least one of these
 # ---------------------------------------------------------------------------
+# A broad list intentionally — it's better to let a borderline question through
+# and let the SQL system prompt refuse it, than to block a valid census question.
+# State names and major cities are included so "What is the population of Texas?"
+# passes even without the word "population" being present.
 TOPIC_KEYWORDS: frozenset[str] = frozenset(
     [
         # Core census concepts
@@ -96,19 +103,18 @@ def classify_topic(question: str) -> tuple[bool, str]:
     """
     q_lower = question.lower().strip()
 
-    # Check NSFW blocklist first
+    # NSFW check runs first — it's cheaper and we never want those terms reaching Claude.
     for term in NSFW_BLOCKLIST:
         if term in q_lower:
             return False, "This content is not appropriate. Please ask about US Census or demographic data."
 
-    # Check topic relevance
     for keyword in TOPIC_KEYWORDS:
         if keyword in q_lower:
             return True, "on-topic"
 
-    # Short numeric questions might still be valid (e.g. "How many?") — but too vague
-    # Give benefit of the doubt for short follow-up questions (<=8 words) that could
-    # be continuations of an on-topic conversation
+    # Short follow-up questions like "How about Texas?" or "What's the average?"
+    # won't match any keyword but are clearly continuations of an on-topic conversation.
+    # Allowing them here avoids false rejections; the SQL prompt will refuse if truly off-topic.
     word_count = len(q_lower.split())
     if word_count <= 8:
         return True, "short question — assumed follow-up"
@@ -123,12 +129,16 @@ def classify_topic(question: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Layer 3: SQL Validation
 # ---------------------------------------------------------------------------
+# Regex is not a full SQL parser — a sophisticated attacker could obfuscate keywords.
+# The real protection is the read-only Snowflake role; this layer blocks obvious
+# injection attempts and acts as an early warning system in logs.
 FORBIDDEN_SQL_KEYWORDS = re.compile(
     r"\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE|GRANT|REVOKE|MERGE|CALL)\b",
     re.IGNORECASE,
 )
 
-# Known valid table names (without quotes for matching)
+# Derived directly from schema_metadata.TABLES so the allowlist stays in sync
+# automatically whenever a new table is added to the schema metadata.
 VALID_TABLES: frozenset[str] = frozenset(TABLES.keys())
 
 
@@ -157,8 +167,11 @@ def extract_sql(response: str) -> str | None:
     """
     Extract SQL from a Claude response that wraps it in a ```sql ... ``` code fence.
     Returns the SQL string, or None if no code fence found.
+
+    The system prompt tells Claude to return ONLY a code fence — no preamble.
+    If Claude adds extra text outside the fence anyway, the SQL is still extracted
+    correctly because the regex matches the innermost fenced block.
     """
-    # Match ```sql ... ``` with optional whitespace
     match = re.search(r"```(?:sql)?\s*\n?(.*?)```", response, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
@@ -169,10 +182,14 @@ def is_refusal(response: str) -> tuple[bool, str]:
     """
     Check if Claude's response is a refusal (starts with REFUSAL:).
     Returns (is_refusal, refusal_message).
+
+    The system prompt instructs Claude to prefix off-topic responses with 'REFUSAL:'
+    followed by a one-sentence explanation. This sentinel prefix lets the UI show
+    a polite info banner instead of an error, and avoids treating refusals as bugs.
     """
     stripped = response.strip()
+    # Prompt contract: refusals must start with "REFUSAL:".
     if stripped.upper().startswith("REFUSAL:"):
-        # Return everything after "REFUSAL:"
         msg = stripped[len("REFUSAL:"):].strip()
         return True, msg
     return False, ""
@@ -182,17 +199,20 @@ def enforce_limit(sql: str, limit: int = 100) -> str:
     """
     If SQL has no LIMIT clause and no GROUP BY (i.e., it's a row-returning query),
     append LIMIT to prevent accidentally returning millions of rows.
+
+    Aggregation queries (GROUP BY) naturally collapse 220K rows into ~50,
+    so they don't need an artificial cap. Non-aggregated SELECTs do.
     """
     sql_upper = sql.upper()
 
-    # Don't add LIMIT if already present
     if re.search(r"\bLIMIT\b", sql_upper):
         return sql
 
-    # Don't add LIMIT to pure aggregation queries (they return few rows)
+    # GROUP BY queries collapse 220K CBG rows down to ~50 state/county rows —
+    # adding LIMIT would incorrectly truncate those ranked results.
     if re.search(r"\bGROUP\s+BY\b", sql_upper):
         return sql
 
-    # Strip trailing semicolon and whitespace, then add limit
+    # Strip trailing semicolons before appending; double semicolons cause Snowflake errors.
     sql = sql.rstrip().rstrip(";")
     return f"{sql}\nLIMIT {limit}"

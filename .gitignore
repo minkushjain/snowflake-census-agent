@@ -11,3 +11,6 @@ build/
 .venv/
 venv/
 .claude/
+
+# Assignment / personal docs
+*.txt

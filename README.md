@@ -140,7 +140,7 @@ GRANT ROLE ACCOUNTADMIN TO USER CENSUS_APP_USER;
 Then in Streamlit Cloud's secrets editor, use:
 ```toml
 [connections.snowflake]
-account = "MWPUHVR-HIC95565"
+account = "YOUR-ACCOUNT-IDENTIFIER"   # e.g. xy12345.us-east-1
 user = "CENSUS_APP_USER"
 password = "choose-a-strong-password"
 warehouse = "COMPUTE_WH"
